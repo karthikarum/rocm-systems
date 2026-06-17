@@ -240,13 +240,19 @@ protected:
     }
 
     // Helper: Connect to remote
+    // rocmNetIb plugin casts sendDevComm to ncclNet_ctxt_t* to extract chId
+    // on AINIC clusters (rcclAinicRoce==true), so we must pass a valid pointer.
     ncclResult_t ConnectToRemote(int dev, ncclNetHandle_t* handle, void** sendComm) {
-        return net_->connect(initCtx_, dev, handle, sendComm, nullptr);
+        ncclNet_ctxt_t devCtx = {0};
+        return net_->connect(initCtx_, dev, handle, sendComm,
+                             reinterpret_cast<ncclNetDeviceHandle_t**>(&devCtx));
     }
 
     // Helper: Accept connection
     ncclResult_t AcceptConnection(void* listenComm, void** recvComm) {
-        return net_->accept(listenComm, recvComm, nullptr);
+        ncclNet_ctxt_t devCtx = {0};
+        return net_->accept(listenComm, recvComm,
+                            reinterpret_cast<ncclNetDeviceHandle_t**>(&devCtx));
     }
 
     // Helper: Register memory
@@ -777,6 +783,16 @@ protected:
         void* listenComm = nullptr;  // non-null on receiverRank
     };
 
+    // Compute the local rank (rank within this node) using MPI shared-memory domain.
+    static int getLocalRank() {
+        MPI_Comm node_comm;
+        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+        int local_rank;
+        MPI_Comm_rank(node_comm, &local_rank);
+        MPI_Comm_free(&node_comm);
+        return local_rank;
+    }
+
     // Setup a point-to-point connection between two specific ranks.
     // All ranks must call this together; non-participating ranks only hit the barrier.
     void SetupDirectedConnection(int dev, DirectedConnection& conn,
@@ -821,6 +837,50 @@ protected:
             EXPECT_NE(conn.sendComm, nullptr);
         }
         // All ranks synchronize — must be reached unconditionally.
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    // Overload: each rank uses its own NIC device for multi-NIC tests.
+    // rankDevMap maps global rank → device index. Ranks not in the map use dev 0.
+    void SetupDirectedConnectionMultiDev(const std::vector<int>& rankDevMap,
+                                         DirectedConnection& conn,
+                                         int senderRank, int receiverRank,
+                                         int mpiTag = 0) {
+        const int rank = MPIEnvironment::world_rank;
+        int myDev = (rank >= 0 && rank < static_cast<int>(rankDevMap.size()))
+                        ? rankDevMap[rank] : 0;
+        conn.senderRank   = senderRank;
+        conn.receiverRank = receiverRank;
+        ncclNetHandle_t handle;
+        memset(&handle, 0, sizeof(handle));
+
+        bool ok = true;
+        if (rank == receiverRank) {
+            ncclResult_t r = CreateListenComm(myDev, &handle, &conn.listenComm);
+            EXPECT_EQ(r, ncclSuccess) << "CreateListenComm failed, rank=" << rank << " dev=" << myDev;
+            EXPECT_NE(conn.listenComm, nullptr);
+            ok = (r == ncclSuccess && conn.listenComm != nullptr);
+            if (ok) {
+                MPI_Send(&handle, sizeof(handle), MPI_BYTE, senderRank, mpiTag, MPI_COMM_WORLD);
+                for (int i = 0; i < kMaxRetryAttempts && conn.recvComm == nullptr; i++) {
+                    r = AcceptConnection(conn.listenComm, &conn.recvComm);
+                    EXPECT_EQ(r, ncclSuccess) << "AcceptConnection failed, rank=" << rank;
+                    if (!conn.recvComm) usleep(kPollIntervalUs);
+                }
+                EXPECT_NE(conn.recvComm, nullptr);
+            } else {
+                MPI_Send(&handle, sizeof(handle), MPI_BYTE, senderRank, mpiTag, MPI_COMM_WORLD);
+            }
+        } else if (rank == senderRank) {
+            MPI_Recv(&handle, sizeof(handle), MPI_BYTE, receiverRank, mpiTag,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            for (int i = 0; i < kMaxRetryAttempts && conn.sendComm == nullptr; i++) {
+                ncclResult_t r = ConnectToRemote(myDev, &handle, &conn.sendComm);
+                EXPECT_EQ(r, ncclSuccess) << "ConnectToRemote failed, rank=" << rank << " dev=" << myDev;
+                if (!conn.sendComm) usleep(kPollIntervalUs);
+            }
+            EXPECT_NE(conn.sendComm, nullptr);
+        }
         MPI_Barrier(MPI_COMM_WORLD);
     }
 

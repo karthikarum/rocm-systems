@@ -313,6 +313,7 @@ if(BUILD_TESTS)
       transport/NetIbMPI/FaultInjectTests.cpp
       transport/GinMPI/GinMPITests.cpp
       transport/NetIbMPI/StressTests.cpp
+      transport/NetIbMPI/PCIeOrderingTests.cpp
       transport/GinDeviceMPITests.cpp
       WarpSpeedMPITests.cpp
       ImplicitLaunchOrderMPITests.cpp
